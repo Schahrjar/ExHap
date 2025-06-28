@@ -1,140 +1,131 @@
 #!/usr/bin/env python3
-
 import argparse
 import gzip
+import sys
 from collections import defaultdict
-from itertools import combinations
-import os
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Extract homozygous haplotypes from a VCF file and find shared haplotypes across samples.")
-    parser.add_argument("-i", "--input", required=True, help="Input VCF file (bgzipped and indexed).")
-    parser.add_argument("-o", "--output", required=True, help="Output BED file for homozygous blocks.")
-    parser.add_argument("-ho", "--haplotype_output", required=False, help="Output BED file for shared haplotypes.")
-    parser.add_argument("-d", "--max_distance", type=int, default=10000, help="Max distance between variants to merge into a block.")
-    parser.add_argument("-m", "--min_support", type=int, default=2, help="Minimum number of samples sharing a haplotype.")
-    parser.add_argument("-l", "--min_loci", type=int, default=5, help="Minimum number of variant loci to define a shared haplotype.")
+    parser = argparse.ArgumentParser(description="ExHap: detect shared homozygous haplotypes.")
+    parser.add_argument("-i", "--input", required=True, help="Input VCF (.vcf or .vcf.gz)")
+    parser.add_argument("-o", "--output", required=True, help="BED file of homozygous blocks")
+    parser.add_argument("-d", "--maxdist", type=int, default=10000, help="Max distance between variants in a block")
+    parser.add_argument("-ho", "--haplotype_output", help="BED file for shared haplotypes")
+    parser.add_argument("--min_hap_length", type=int, default=0, help="Minimum haplotype length (bp) to output")
+    parser.add_argument("--min_support", type=int, default=2, help="Minimum samples sharing a haplotype")
+    parser.add_argument("--min_loci", type=int, default=2, help="Minimum variant count defining a haplotype")
     return parser.parse_args()
 
-def parse_vcf(input_file):
-    genotypes = defaultdict(list)
-    positions = []
+def open_vcf(path):
+    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "r")
 
-    open_func = gzip.open if input_file.endswith(".gz") else open
-    with open_func(input_file, 'rt') as f:
+def extract_samples_and_genotypes(vcf_file):
+    samples = []
+    variants = []
+    with open_vcf(vcf_file) as f:
         for line in f:
+            if line.startswith("##"):
+                continue
             if line.startswith("#CHROM"):
-                header = line.strip().split("\t")
-                samples = header[9:]
-            elif line.startswith("#"):
+                samples = line.strip().split("\t")[9:]
                 continue
-            else:
-                fields = line.strip().split("\t")
-                chrom = fields[0]
-                pos = int(fields[1])
-                ref = fields[3]
-                alt = fields[4]
-                format_keys = fields[8].split(":")
-                sample_fields = fields[9:]
+            fields = line.strip().split("\t")
+            chrom, pos, _, ref, alt, *_ , fmt = fields[:9]
+            pos = int(pos)
+            gt_index = fmt.split(":").index("GT")
+            gt_list = [s.split(":")[gt_index] if len(s.split(":")) > gt_index else "./." for s in fields[9:]]
+            variants.append((chrom, pos, gt_list))
+    return samples, variants
 
-                gt_index = format_keys.index("GT")
-                block_genotypes = {}
-                for sample, sample_data in zip(samples, sample_fields):
-                    values = sample_data.split(":")
-                    if len(values) <= gt_index:
-                        continue
-                    gt = values[gt_index].replace('|', '/')
-                    if gt in {"0/0", "1/1"}:
-                        block_genotypes[sample] = "HOM_REF" if gt == "0/0" else "HOM_ALT"
-                genotypes[(chrom, pos)].append(block_genotypes)
-                positions.append((chrom, pos))
+def is_homozygous(gt):
+    if gt in ("0/0", "0|0"):
+        return "HOM_REF"
+    if gt in ("1/1", "1|1"):
+        return "HOM_ALT"
+    return None
 
-    return samples, genotypes, positions
+def build_pattern(samples, gt_list):
+    parts = []
+    for s, gt in zip(samples, gt_list):
+        h = is_homozygous(gt)
+        if h:
+            parts.append(f"{s}:{h}")
+    return "|".join(sorted(parts)) if parts else None
 
-def cluster_blocks(positions, genotypes, max_distance):
-    blocks = []
-    block = []
-    for i in range(len(positions)):
-        chrom, pos = positions[i]
-        if not block:
-            block = [positions[i]]
-        else:
-            prev_chrom, prev_pos = block[-1]
-            if chrom == prev_chrom and (pos - prev_pos <= max_distance):
-                block.append(positions[i])
-            else:
-                blocks.append(block)
-                block = [positions[i]]
-    if block:
-        blocks.append(block)
-    return blocks
+def group_variants(variants, maxdist, samples):
+    chrom_pattern = defaultdict(lambda: defaultdict(list))
+    for chrom, pos, gt_list in variants:
+        pat = build_pattern(samples, gt_list)
+        if not pat:
+            continue
+        chrom_pattern[chrom][pat].append(pos)
 
-def write_bed(blocks, genotypes, samples, output_file):
-    with open(output_file, 'w') as out:
-        for block in blocks:
-            chrom = block[0][0]
-            start = block[0][1]
-            end = block[-1][1]
-            positions = [pos for _, pos in block]
-            per_sample_gt = defaultdict(list)
-            for pos in block:
-                gt = genotypes[pos][0]
-                for s in gt:
-                    per_sample_gt[s].append(gt[s])
-            genotype_summary = []
-            for s in samples:
-                if s in per_sample_gt:
-                    if all(g == "HOM_REF" for g in per_sample_gt[s]):
-                        genotype_summary.append(f"{s}:HOM_REF")
-                    elif all(g == "HOM_ALT" for g in per_sample_gt[s]):
-                        genotype_summary.append(f"{s}:HOM_ALT")
-                    else:
-                        genotype_summary.append(f"{s}:MIXED")
-            allele_count = sum([1 for x in genotype_summary if "HOM_ALT" in x])
-            out.write(f"{chrom}\t{start}\t{end}\t{'|'.join(genotype_summary)}\t{allele_count}\t.\t{';'.join(map(str, positions))}\n")
+    groups = []
+    for chrom in chrom_pattern:
+        for pat in chrom_pattern[chrom]:
+            pos_list = sorted(chrom_pattern[chrom][pat])
+            start = pos_list[0]
+            end = start
+            temp = [start]
+            for p in pos_list[1:]:
+                if p - end <= maxdist:
+                    end = p
+                    temp.append(p)
+                else:
+                    groups.append((chrom, start, end, pat, temp))
+                    start = p
+                    end = p
+                    temp = [p]
+            groups.append((chrom, start, end, pat, temp))
+    return groups
 
-def extract_haplotypes(blocks, genotypes, samples, min_support, min_loci, haplo_out):
-    haplo_dict = defaultdict(lambda: defaultdict(list))  # haplo_dict[sample][haplo_signature] = [(start, end, chrom, positions)]
-    final_haplotypes = []
+def write_bed(groups, out):
+    for chrom, start, end, pat, pos_list in groups:
+        score = len(pos_list)
+        out.write(f"{chrom}\t{start-1}\t{end}\t{pat}\t{score}\t.\t{';'.join(map(str,pos_list))}\n")
 
-    for block in blocks:
-        chrom = block[0][0]
-        start = block[0][1]
-        end = block[-1][1]
-        positions = [pos for _, pos in block]
+def extract_shared_haplotypes(groups, samples, args):
+    haps = []
+    hid = 1
+    for i, (chrom, s0, e0, pat0, pos0) in enumerate(groups):
+        samples0 = set(x.split(":")[0] for x in pat0.split("|"))
+        gt0 = pat0.split("|")[0].split(":")[1]  # homozygous type
+        if len(samples0) < args.min_support or len(pos0) < args.min_loci: 
+            continue
 
-        for sample in samples:
-            sig = []
-            for pos in block:
-                gt = genotypes[pos][0]
-                sig.append(gt.get(sample, "NA"))
-            if "NA" in sig:
-                continue
-            haplo_sig = ",".join(sig)
-            haplo_dict[haplo_sig][tuple(sig)].append((start, end, chrom, positions, sample))
+        start, end, positions = s0, e0, pos0.copy()
+        shared = samples0.copy()
+        for _, s1, e1, pat1, pos1 in groups[i+1:]:
+            if _ != chrom or s1 - end > args.maxdist:
+                break
+            samples1 = set(x.split(":")[0] for x in pat1.split("|"))
+            merged = shared & samples1
+            if len(merged) < args.min_support:
+                break
+            shared = merged
+            end = e1
+            positions.extend(pos1)
 
-    for haplo_sig in haplo_dict:
-        sample_map = defaultdict(list)
-        for sig, entries in haplo_dict[haplo_sig].items():
-            for start, end, chrom, positions, sample in entries:
-                sample_map[(chrom, start, end, ",".join(map(str, positions)))].append(sample)
-
-        for (chrom, start, end, pos_str), sample_list in sample_map.items():
-            if len(sample_list) >= min_support and pos_str.count(',')+1 >= min_loci:
-                final_haplotypes.append((chrom, start, end, sample_list, pos_str))
-
-    with open(haplo_out, 'w') as out:
-        for chrom, start, end, samples, pos_str in final_haplotypes:
-            out.write(f"{chrom}\t{start}\t{end}\tHAPLOTYPE\t{';'.join(samples)}\t{len(samples)}\t{pos_str}\n")
+        length = end - start + 1
+        if shared and len(shared) >= args.min_support and len(positions) >= args.min_loci and length >= args.min_hap_length:
+            haps.append((chrom, start, end, f"HAPLOTYPE{hid}", len(shared), length, ",".join(sorted(shared))))
+            hid += 1
+    return haps
 
 def main():
     args = parse_args()
-    samples, genotypes, positions = parse_vcf(args.input)
-    blocks = cluster_blocks(positions, genotypes, args.max_distance)
-    write_bed(blocks, genotypes, samples, args.output)
+    samples, variants = extract_samples_and_genotypes(args.input)
+    groups = group_variants(variants, args.maxdist, samples)
+
+    with open(args.output, "w") as bed_out:
+        write_bed(groups, bed_out)
+    print(f"Homozygous blocks written to {args.output}")
 
     if args.haplotype_output:
-        extract_haplotypes(blocks, genotypes, samples, args.min_support, args.min_loci, args.haplotype_output)
+        haps = extract_shared_haplotypes(groups, samples, args)
+        with open(args.haplotype_output, "w") as hap_out:
+            for rec in haps:
+                hap_out.write("\t".join(map(str, rec))+"\n")
+        print(f"Shared haplotypes written to {args.haplotype_output} ({len(haps)} entries)")
 
 if __name__ == "__main__":
     main()
