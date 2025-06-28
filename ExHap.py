@@ -1,146 +1,140 @@
 #!/usr/bin/env python3
-import sys
-import gzip
+
 import argparse
+import gzip
 from collections import defaultdict
+from itertools import combinations
+import os
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ROH-DICE-lite: Group homozygous variants by sample pattern and proximity")
-    parser.add_argument("-i", "--input", required=True, help="Input VCF (can be .vcf or .vcf.gz)")
-    parser.add_argument("-o", "--output", required=True, help="Output BED file")
-    parser.add_argument("-d", "--maxdist", type=int, default=1_000_000, help="Max distance between variants in a group (default 1Mb)")
+    parser = argparse.ArgumentParser(description="Extract homozygous haplotypes from a VCF file and find shared haplotypes across samples.")
+    parser.add_argument("-i", "--input", required=True, help="Input VCF file (bgzipped and indexed).")
+    parser.add_argument("-o", "--output", required=True, help="Output BED file for homozygous blocks.")
+    parser.add_argument("-ho", "--haplotype_output", required=False, help="Output BED file for shared haplotypes.")
+    parser.add_argument("-d", "--max_distance", type=int, default=10000, help="Max distance between variants to merge into a block.")
+    parser.add_argument("-m", "--min_support", type=int, default=2, help="Minimum number of samples sharing a haplotype.")
+    parser.add_argument("-l", "--min_loci", type=int, default=5, help="Minimum number of variant loci to define a shared haplotype.")
     return parser.parse_args()
 
-def open_vcf(file):
-    if file.endswith(".gz"):
-        return gzip.open(file, "rt")
-    else:
-        return open(file, "r")
+def parse_vcf(input_file):
+    genotypes = defaultdict(list)
+    positions = []
 
-def extract_samples_and_genotypes(vcf_file):
-    samples = []
-    variants = []
-    with open_vcf(vcf_file) as f:
+    open_func = gzip.open if input_file.endswith(".gz") else open
+    with open_func(input_file, 'rt') as f:
         for line in f:
-            if line.startswith("##"):
-                continue
             if line.startswith("#CHROM"):
-                parts = line.strip().split('\t')
-                samples = parts[9:]
+                header = line.strip().split("\t")
+                samples = header[9:]
+            elif line.startswith("#"):
                 continue
-            parts = line.strip().split('\t')
-            chrom, pos, id_, ref, alt, qual, filt, info, fmt = parts[:9]
-            genotypes = parts[9:]
-            pos = int(pos)
-            
-            # Format fields are colon-separated, get GT field index:
-            fmt_fields = fmt.split(":")
-            try:
-                gt_idx = fmt_fields.index("GT")
-            except ValueError:
-                # No GT field
+            else:
+                fields = line.strip().split("\t")
+                chrom = fields[0]
+                pos = int(fields[1])
+                ref = fields[3]
+                alt = fields[4]
+                format_keys = fields[8].split(":")
+                sample_fields = fields[9:]
+
+                gt_index = format_keys.index("GT")
+                block_genotypes = {}
+                for sample, sample_data in zip(samples, sample_fields):
+                    values = sample_data.split(":")
+                    if len(values) <= gt_index:
+                        continue
+                    gt = values[gt_index].replace('|', '/')
+                    if gt in {"0/0", "1/1"}:
+                        block_genotypes[sample] = "HOM_REF" if gt == "0/0" else "HOM_ALT"
+                genotypes[(chrom, pos)].append(block_genotypes)
+                positions.append((chrom, pos))
+
+    return samples, genotypes, positions
+
+def cluster_blocks(positions, genotypes, max_distance):
+    blocks = []
+    block = []
+    for i in range(len(positions)):
+        chrom, pos = positions[i]
+        if not block:
+            block = [positions[i]]
+        else:
+            prev_chrom, prev_pos = block[-1]
+            if chrom == prev_chrom and (pos - prev_pos <= max_distance):
+                block.append(positions[i])
+            else:
+                blocks.append(block)
+                block = [positions[i]]
+    if block:
+        blocks.append(block)
+    return blocks
+
+def write_bed(blocks, genotypes, samples, output_file):
+    with open(output_file, 'w') as out:
+        for block in blocks:
+            chrom = block[0][0]
+            start = block[0][1]
+            end = block[-1][1]
+            positions = [pos for _, pos in block]
+            per_sample_gt = defaultdict(list)
+            for pos in block:
+                gt = genotypes[pos][0]
+                for s in gt:
+                    per_sample_gt[s].append(gt[s])
+            genotype_summary = []
+            for s in samples:
+                if s in per_sample_gt:
+                    if all(g == "HOM_REF" for g in per_sample_gt[s]):
+                        genotype_summary.append(f"{s}:HOM_REF")
+                    elif all(g == "HOM_ALT" for g in per_sample_gt[s]):
+                        genotype_summary.append(f"{s}:HOM_ALT")
+                    else:
+                        genotype_summary.append(f"{s}:MIXED")
+            allele_count = sum([1 for x in genotype_summary if "HOM_ALT" in x])
+            out.write(f"{chrom}\t{start}\t{end}\t{'|'.join(genotype_summary)}\t{allele_count}\t.\t{';'.join(map(str, positions))}\n")
+
+def extract_haplotypes(blocks, genotypes, samples, min_support, min_loci, haplo_out):
+    haplo_dict = defaultdict(lambda: defaultdict(list))  # haplo_dict[sample][haplo_signature] = [(start, end, chrom, positions)]
+    final_haplotypes = []
+
+    for block in blocks:
+        chrom = block[0][0]
+        start = block[0][1]
+        end = block[-1][1]
+        positions = [pos for _, pos in block]
+
+        for sample in samples:
+            sig = []
+            for pos in block:
+                gt = genotypes[pos][0]
+                sig.append(gt.get(sample, "NA"))
+            if "NA" in sig:
                 continue
-            
-            # Extract GT per sample
-            gt_list = []
-            for gt_field in genotypes:
-                gt_data = gt_field.split(":")
-                if len(gt_data) <= gt_idx:
-                    gt_list.append("./.")  # missing
-                else:
-                    gt_list.append(gt_data[gt_idx])
-            
-            variants.append((chrom, pos, ref, alt, gt_list))
-    return samples, variants
+            haplo_sig = ",".join(sig)
+            haplo_dict[haplo_sig][tuple(sig)].append((start, end, chrom, positions, sample))
 
-def is_homozygous(gt):
-    # Accept only 0/0 or 1/1 (including phased and unphased)
-    if gt in {"0/0", "0|0"}:
-        return "HOM_REF"
-    elif gt in {"1/1", "1|1"}:
-        return "HOM_ALT"
-    else:
-        return None
+    for haplo_sig in haplo_dict:
+        sample_map = defaultdict(list)
+        for sig, entries in haplo_dict[haplo_sig].items():
+            for start, end, chrom, positions, sample in entries:
+                sample_map[(chrom, start, end, ",".join(map(str, positions)))].append(sample)
 
-def build_pattern(samples, gt_list):
-    # For each sample, if homozygous, record sample:state, else ignore
-    pattern_parts = []
-    for s, gt in zip(samples, gt_list):
-        state = is_homozygous(gt)
-        if state is not None:
-            pattern_parts.append(f"{s}:{state}")
-    if pattern_parts:
-        return "|".join(sorted(pattern_parts))
-    else:
-        return None
+        for (chrom, start, end, pos_str), sample_list in sample_map.items():
+            if len(sample_list) >= min_support and pos_str.count(',')+1 >= min_loci:
+                final_haplotypes.append((chrom, start, end, sample_list, pos_str))
 
-def group_variants(variants, maxdist):
-    """
-    Group variants by chrom and pattern, grouping adjacent variants
-    of the same pattern within maxdist basepairs.
-    """
-    grouped = []
-    # Data structure: chrom -> pattern -> list of (pos, ref, alt)
-    chrom_pattern_pos = defaultdict(lambda: defaultdict(list))
-    
-    for chrom, pos, ref, alt, gt_list in variants:
-        pattern = build_pattern(samples, gt_list)
-        if pattern is None:
-            continue
-        chrom_pattern_pos[chrom][pattern].append((pos, ref, alt))
-    
-    for chrom in chrom_pattern_pos:
-        for pattern in chrom_pattern_pos[chrom]:
-            # Sort positions ascending
-            pos_list = sorted(chrom_pattern_pos[chrom][pattern], key=lambda x: x[0])
-            
-            # Group nearby variants
-            group_start = pos_list[0][0]
-            group_end = pos_list[0][0]
-            group_vars = [pos_list[0]]
-            
-            for i in range(1, len(pos_list)):
-                curr_pos = pos_list[i][0]
-                prev_pos = pos_list[i-1][0]
-                if curr_pos - prev_pos <= maxdist:
-                    group_end = curr_pos
-                    group_vars.append(pos_list[i])
-                else:
-                    # save previous group
-                    grouped.append((chrom, group_start, group_end, pattern, group_vars))
-                    # start new group
-                    group_start = curr_pos
-                    group_end = curr_pos
-                    group_vars = [pos_list[i]]
-            # save last group
-            grouped.append((chrom, group_start, group_end, pattern, group_vars))
-    return grouped
+    with open(haplo_out, 'w') as out:
+        for chrom, start, end, samples, pos_str in final_haplotypes:
+            out.write(f"{chrom}\t{start}\t{end}\tHAPLOTYPE\t{';'.join(samples)}\t{len(samples)}\t{pos_str}\n")
 
-def write_bed(groups, out_file):
-    """
-    BED fields:
-    chrom (str)
-    start (int, 0-based)
-    end (int, 1-based)
-    name (pattern string)
-    score (number of variants in group)
-    strand (.)
-    details (semicolon separated variant positions 1-based)
-    """
-    with open(out_file, "w") as f:
-        for chrom, start, end, pattern, vars_ in groups:
-            # BED start is 0-based, so subtract 1 from start position
-            bed_start = start - 1
-            bed_end = end  # BED end is 1-based, non-inclusive but we keep 1-based here
-            
-            positions = [str(p[0]) for p in vars_]
-            details = ";".join(positions)
-            score = len(vars_)
-            f.write(f"{chrom}\t{bed_start}\t{bed_end}\t{pattern}\t{score}\t.\t{details}\n")
+def main():
+    args = parse_args()
+    samples, genotypes, positions = parse_vcf(args.input)
+    blocks = cluster_blocks(positions, genotypes, args.max_distance)
+    write_bed(blocks, genotypes, samples, args.output)
+
+    if args.haplotype_output:
+        extract_haplotypes(blocks, genotypes, samples, args.min_support, args.min_loci, args.haplotype_output)
 
 if __name__ == "__main__":
-    args = parse_args()
-    samples, variants = extract_samples_and_genotypes(args.input)
-    groups = group_variants(variants, args.maxdist)
-    write_bed(groups, args.output)
-    print(f"ROH-DICE-lite finished. Output written to {args.output}")
+    main()
