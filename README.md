@@ -2,10 +2,10 @@
 [![last commit](https://img.shields.io/github/last-commit/Schahrjar/ExHap)](https://github.com/Schahrjar/ExHap/commits/main)
 
 # ExHap
-The tool retrievs homozygosity haplotypes from a multi-sample VCF file. Manily developed for exome variants of rare disorder patients to investigate if a common pathogenic mutation is a recurrent or founder variant.
+The tool retrievs homozygosity haplotypes from a multi-sample VCF file. Manily developed for exome variants of rare disorder patients to investigate if a common pathogenic mutation is a recurrent or founder variant. ExHap considers every signle variant in runs of homozygosity (ROH) of each sample to find any possible homozygous haplotype shared between two or more samples. Then reports the largest haplotype (and sub-haplotypes if any) in a BED file.
 
 > [!NOTE]
-> Find shared homozygous haplotypes in any cohort of genomic variants, visualise haplotypes, and calculate age of the most recent common acestor of the variant of interest.
+> Feasibly find shared homozygous haplotypes in any cohort of genomic variants, visualise haplotypes, and calculate age of the most recent common acestor of any variant of interest.
 
 ## 🔧 Features
 - Identifies all individual ROH per sample
