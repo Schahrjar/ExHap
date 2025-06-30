@@ -7,6 +7,7 @@ import argparse
 from scipy.stats import gamma # For MRCA calculation
 import matplotlib.ticker as mticker # For integer colorbar ticks
 import matplotlib.patches as mpatches # For legend handles
+from collections import defaultdict # Added for the MRCA logic update
 
 # --- MRCA Calculation Function ---
 def calculate_mrca_age(l_lengths_mbp, r_lengths_mbp, confidence_coefficient=0.95, generation_time_years=20):
@@ -49,7 +50,7 @@ def calculate_mrca_age(l_lengths_mbp, r_lengths_mbp, confidence_coefficient=0.95
     # Given cs_correction = 0 (from example), i.cs.correction will always be 0.
     i_cs_correction = 0 
     
-    # Initialize all return values with None or "N/A"
+    # Initialize all return values with "N/A"
     independent_tau_hat, independent_l, independent_u = "N/A", "N/A", "N/A"
     independent_tau_hat_years, independent_l_years, independent_u_years = "N/A", "N/A", "N/A"
     correlated_tau_hat, correlated_l, correlated_u = "N/A", "N/A", "N/A"
@@ -94,11 +95,11 @@ def calculate_mrca_age(l_lengths_mbp, r_lengths_mbp, confidence_coefficient=0.95
             var_lengths = np.var(lengths)
 
             if mean_lengths == 0 and var_lengths == 0: # All lengths are zero
-                 rho_hat = 1.0 # Perfect correlation
+                rho_hat = 1.0 # Perfect correlation
             elif var_lengths == 0: # No variance in lengths, but mean is non-zero
                 rho_hat = 1.0 # Perfect correlation
             elif mean_lengths == 0: # Mean is zero, but variance is not (shouldn't happen with positive lengths)
-                 rho_hat = 0.0 # Cannot compute, assume no correlation
+                rho_hat = 0.0 # Cannot compute, assume no correlation
             else:
                 numerator = (n * (mean_lengths) ** 2 - var_lengths * (1 + 2 * n))
                 denominator = (n * (mean_lengths) ** 2 + var_lengths * (n - 1))
@@ -113,13 +114,13 @@ def calculate_mrca_age(l_lengths_mbp, r_lengths_mbp, confidence_coefficient=0.95
                 n_star = n
             elif n_star <= 0: # Must be positive for gamma distribution
                 n_star = 1 # Minimum effective sample size
-            
+        
             # Additional correction for n_star based on rho_hat in R script
             if rho_hat < -2 / (n - 1):
                 n_star = n / (1 + (n - 1) * abs(rho_hat))
             elif -2/(n-1) <= rho_hat and rho_hat < -1/(n-1):
                 n_star = n
-            
+        
             if n_star <= 0: # Double check, should be caught above but for safety
                 n_star = 1
 
@@ -166,8 +167,9 @@ def plot_shared_haplotypes(haplotype_output_file, target_chrom=None, genomic_ran
     Sub-segments are visually separated by sorting.
     """
     try:
+        # UPDATED: Added 'Haplotype_Length_BP' to the names list for the 5th column
         df = pd.read_csv(haplotype_output_file, sep='\t', header=None, 
-                         names=['chrom', 'start', 'end', 'Haplotype_ID', 'Num_Samples', 'Sample_Names', 'Variant_Loci_Positions'])
+                         names=['chrom', 'start', 'end', 'Haplotype_ID', 'Haplotype_Length_BP', 'Num_Samples', 'Sample_Names', 'Variant_Loci_Positions'])
     except FileNotFoundError:
         print(f"Error: Input file '{haplotype_output_file}' not found.")
         return
@@ -191,7 +193,7 @@ def plot_shared_haplotypes(haplotype_output_file, target_chrom=None, genomic_ran
                 raise ValueError("Start position must be less than end position.")
             print(f"DEBUG: Plotting within specified range: {plot_chrom}:{plot_start:,}-{plot_end:,}")
         except (IndexError, ValueError):
-            print(f"Error: Invalid genomic range format '{genomic_range}'. Expected 'chr:start-end'. Plotting will proceed without range filtering.")
+            print(f"Error: Invalid genomic range format '{genomic_range}'. Expected 'chrom:start-end'. Plotting will proceed without range filtering.")
             plot_start, plot_end = None, None # Disable range filtering
 
     # Filter DataFrame by chromosome
@@ -244,15 +246,35 @@ def plot_shared_haplotypes(haplotype_output_file, target_chrom=None, genomic_ran
                 mrca_l_lengths = []
                 mrca_r_lengths = []
                 
-                # Iterate over the *already filtered* DataFrame 'df'
-                for _, row in df.iterrows(): 
-                    # Ensure haplotype segment contains the MRCA variant
-                    if row['start'] <= mrca_variant_pos <= row['end']:
-                        mrca_l_lengths.append((mrca_variant_pos - row['start']) / 1_000_000) # Convert bp to Mbp
-                        mrca_r_lengths.append((row['end'] - mrca_variant_pos) / 1_000_000) # Convert bp to Mbp
+                # Dictionary to store the longest haplotype found so far for each sample
+                # Key: sample_name, Value: (haplotype_length_bp, start_pos, end_pos)
+                sample_longest_hap_info = defaultdict(lambda: (0, 0, 0)) # (length, start, end)
+
+                # First pass: Identify the longest spanning haplotype for each unique sample
+                for _, row in df.iterrows():
+                    # Ensure haplotype segment contains the MRCA variant AND is on the correct chromosome
+                    # (df is already filtered by chromosome and range, but good to be explicit for logic)
+                    if row['start'] <= mrca_variant_pos <= row['end'] and row['chrom'] == mrca_variant_chrom:
+                        hap_length_bp = row['end'] - row['start'] + 1 
+                        
+                        # Split sample names (e.g., "sample1;sample2")
+                        samples_in_row = row['Sample_Names'].split(';')
+                        
+                        for sample in samples_in_row:
+                            current_longest_length, _, _ = sample_longest_hap_info[sample]
+                            
+                            if hap_length_bp > current_longest_length:
+                                # Update if this haplotype is longer for this sample
+                                sample_longest_hap_info[sample] = (hap_length_bp, row['start'], row['end'])
+                
+                # Second pass: Collect l_lengths and r_lengths from the identified longest haplotypes
+                for sample, (longest_length_bp, hap_start, hap_end) in sample_longest_hap_info.items():
+                    if longest_length_bp > 0: # Ensure a valid haplotype was found for the sample
+                        mrca_l_lengths.append((mrca_variant_pos - hap_start) / 1_000_000) # Convert bp to Mbp
+                        mrca_r_lengths.append((hap_end - mrca_variant_pos) / 1_000_000) # Convert bp to Mbp
 
                 if mrca_l_lengths:
-                    print(f"DEBUG: Found {len(mrca_l_lengths)} shared homozygous haplotype segments spanning {mrca_variant_str} for MRCA calculation.")
+                    print(f"DEBUG: Found {len(mrca_l_lengths)} unique sample segments spanning {mrca_variant_str} for MRCA calculation.")
                     
                     indep_gen, indep_gen_ci, indep_year, indep_year_ci, \
                     corr_gen, corr_gen_ci, corr_year, corr_year_ci = \
@@ -269,7 +291,7 @@ def plot_shared_haplotypes(haplotype_output_file, target_chrom=None, genomic_ran
                     else:
                         print("MRCA Warning: MRCA calculation returned no valid results. Check debug messages above.")
                 else:
-                    print(f"MRCA Warning: No shared homozygous haplotype segments found spanning {mrca_variant_str} in the filtered data. Cannot calculate MRCA.")
+                    print(f"MRCA Warning: No shared homozygous haplotype segments found spanning {mrca_variant_str} (or within range) for any unique sample. Cannot calculate MRCA.")
 
         except ValueError:
             print(f"MRCA Error: Invalid MRCA variant format '{mrca_variant_str}'. Expected 'chrom:pos'. Skipping MRCA calculation.")
@@ -418,7 +440,7 @@ def plot_shared_haplotypes(haplotype_output_file, target_chrom=None, genomic_ran
             hap_idx = hap_id_to_idx[hap_id]
             color = cmap(norm(hap_idx))
             legend_elements.append(mpatches.Rectangle((0, 0), 1, 1, fc=color, ec="black", 
-                                                      label=str(hap_id))) # Use Haplotype ID string directly
+                                                     label=str(hap_id))) # Use Haplotype ID string directly
 
         # Adjust right margin to make space for the legend
         rect_val_right_adj = 0.75 # More space for legend than for colorbar
