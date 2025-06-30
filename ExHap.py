@@ -5,6 +5,7 @@ import gzip
 from collections import defaultdict
 from itertools import combinations
 import os
+import re # Added for parsing genomic region
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Extract homozygous haplotypes from a VCF file and find shared haplotypes across samples.")
@@ -14,30 +15,72 @@ def parse_args():
     parser.add_argument("-d", "--max_distance", type=int, default=10000, help="Max distance between variants to merge into a block.")
     parser.add_argument("-m", "--min_support", type=int, default=2, help="Minimum number of samples sharing a haplotype.")
     parser.add_argument("-l", "--min_loci", type=int, default=5, help="Minimum number of variant loci to define a shared haplotype.")
+    # NEW ARGUMENT: Genomic region
+    parser.add_argument("-g", "--genomic_region", help="Optional genomic region to limit analysis (e.g., 'chr1' or 'chr1:1000000-2000000').")
     return parser.parse_args()
 
-def parse_vcf(input_file):
+def parse_vcf(input_file, genomic_region=None):
     genotypes = defaultdict(list)
     positions = []
+    
+    # NEW: Parse genomic region if provided
+    target_chrom = None
+    target_start = None
+    target_end = None
+
+    if genomic_region:
+        match = re.match(r'(.+):(\d+)-(\d+)', genomic_region)
+        if match:
+            target_chrom = match.group(1)
+            target_start = int(match.group(2))
+            target_end = int(match.group(3))
+        else:
+            target_chrom = genomic_region # Assume it's just a chromosome name
+            print(f"Note: No start-end coordinates provided for region '{genomic_region}'. Processing the entire chromosome.")
 
     open_func = gzip.open if input_file.endswith(".gz") else open
     with open_func(input_file, 'rt') as f:
+        samples = []
         for line in f:
             if line.startswith("#CHROM"):
                 header = line.strip().split("\t")
                 samples = header[9:]
+                # If a specific chromosome is targeted, and we're past the header, we can potentially optimize
+                # by using pysam.VariantFile.fetch here if VCFs were indexed.
+                # However, with raw file reading (not pysam), we still need to iterate line by line.
+                continue
             elif line.startswith("#"):
                 continue
             else:
                 fields = line.strip().split("\t")
                 chrom = fields[0]
                 pos = int(fields[1])
+
+                # NEW: Apply genomic region filter
+                if target_chrom and chrom != target_chrom:
+                    continue # Skip if not the target chromosome
+                if target_start and pos < target_start:
+                    continue # Skip if position is before the start of the region
+                if target_end and pos > target_end:
+                    # If position is beyond the end, and we're on the target chrom,
+                    # we can stop processing this chromosome
+                    if chrom == target_chrom:
+                        break 
+                    else: # If we processed a different chromosome earlier, continue to the next line
+                        continue
+                
                 ref = fields[3]
                 alt = fields[4]
                 format_keys = fields[8].split(":")
                 sample_fields = fields[9:]
 
-                gt_index = format_keys.index("GT")
+                gt_index = -1
+                try:
+                    gt_index = format_keys.index("GT")
+                except ValueError:
+                    # GT field not found in FORMAT, skip this record
+                    continue
+
                 block_genotypes = {}
                 for sample, sample_data in zip(samples, sample_fields):
                     values = sample_data.split(":")
@@ -46,8 +89,11 @@ def parse_vcf(input_file):
                     gt = values[gt_index].replace('|', '/')
                     if gt in {"0/0", "1/1"}:
                         block_genotypes[sample] = "HOM_REF" if gt == "0/0" else "HOM_ALT"
-                genotypes[(chrom, pos)].append(block_genotypes)
-                positions.append((chrom, pos))
+                
+                # Only add if there's at least one homozygous genotype for the current variant
+                if block_genotypes:
+                    genotypes[(chrom, pos)].append(block_genotypes)
+                    positions.append((chrom, pos))
 
     return samples, genotypes, positions
 
@@ -78,7 +124,7 @@ def write_bed(blocks, genotypes, samples, output_file):
             positions = [pos for _, pos in block]
             per_sample_gt = defaultdict(list)
             for pos in block:
-                gt = genotypes[pos][0]
+                gt = genotypes[pos][0] # Assuming only one genotype dict per (chrom, pos) key
                 for s in gt:
                     per_sample_gt[s].append(gt[s])
             genotype_summary = []
@@ -90,6 +136,8 @@ def write_bed(blocks, genotypes, samples, output_file):
                         genotype_summary.append(f"{s}:HOM_ALT")
                     else:
                         genotype_summary.append(f"{s}:MIXED") 
+                else: # Sample might not have calls in this block's variants
+                    genotype_summary.append(f"{s}:NO_CALL")
             allele_count = sum([1 for x in genotype_summary if "HOM_ALT" in x])
             out.write(f"{chrom}\t{start}\t{end}\t{'|'.join(genotype_summary)}\t{allele_count}\t.\t{';'.join(map(str, positions))}\n")
 
@@ -120,7 +168,9 @@ def extract_haplotypes(blocks, genotypes, samples, min_support, min_loci, haplo_
             segment_start_genomic = -1 
 
             for pos_idx, (chrom_val, pos_genomic) in enumerate(block_of_positions):
-                gt_at_pos = genotypes[(chrom_val, pos_genomic)][0].get(sample_name, None) 
+                # Using .get() with a default of None to handle cases where sample_name or (chrom_val, pos_genomic) might not be in genotypes
+                gt_data = genotypes.get((chrom_val, pos_genomic))
+                gt_at_pos = gt_data[0].get(sample_name, None) if gt_data else None
 
                 if gt_at_pos in {"HOM_REF", "HOM_ALT"}:
                     if not current_segment_genotypes: 
@@ -139,7 +189,7 @@ def extract_haplotypes(blocks, genotypes, samples, min_support, min_loci, haplo_
                         current_segment_variant_positions = []
                         segment_start_genomic = -1 
             
-            if current_segment_genotypes:
+            if current_segment_genotypes: # Check if there's an un-finalized segment at the end of the block
                 if len(current_segment_genotypes) >= min_loci:
                     segment_end_genomic = current_segment_variant_positions[-1]
                     all_individual_homozygous_segments.append(
@@ -231,7 +281,10 @@ def extract_haplotypes(blocks, genotypes, samples, min_support, min_loci, haplo_
 
 def main():
     args = parse_args()
-    samples, genotypes, positions = parse_vcf(args.input)
+    
+    # Pass the genomic_region argument to parse_vcf
+    samples, genotypes, positions = parse_vcf(args.input, args.genomic_region)
+    
     blocks = cluster_blocks(positions, genotypes, args.max_distance)
     write_bed(blocks, genotypes, samples, args.output)
 
