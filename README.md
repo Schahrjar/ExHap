@@ -22,5 +22,6 @@ Clone the repo
 ### Optional
 
 ## 📜 Citation
-
+> Alavi, S. (2025). ExHap: identifying shared homozygosity haplotypes from multi-sample VCF (Version 1.0) [Computer software]. https://github.com/Schahrjar/ExHap
+> 
 This tool is released prior to our manuscript submission to assist researchers. You may contact [Shahryar Alavi](https://schahrjar.github.io/) if you use ExHap in your publication.
