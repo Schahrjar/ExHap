@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use ExHap, please cite it as below."
+authors:
+- family-names: Alavi
+  given-names: Shahryar
+  orcid: "https://orcid.org/0000-0002-3484-3423"
+  affiliation: "UCL Institute of Neurology, London, UK"
+title: "ExHap: identifying shared homozygosity haplotypes from multi-sample VCF"
+version: 1.00
+date-released: 2025-07-03
+url: "https://github.com/Schahrjar/ExHap"
+license: MIT
