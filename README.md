@@ -1,5 +1,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/Schahrjar/ExHap)](https://github.com/Schahrjar/ExHap/releases/latest)
 [![last commit](https://img.shields.io/github/last-commit/Schahrjar/ExHap)](https://github.com/Schahrjar/ExHap/commits/main)
+[![Downloads](https://img.shields.io/github/downloads/Schahrjar/ExHap/total?style=flat-square)](https://github.com/Schahrjar/ExHap/releases)
+[![License](https://img.shields.io/badge/license-MIT-blue)](https://opensource.org/license/mit)
 
 # ExHap
 This tool identifies shared homozygosity haplotype blocks from a multi-sample VCF file. This is manily developed for investigating identity state of common pathogenic variants in rare disorder patients, if such variants are recurrent or founder. ExHap considers every signle variant in runs of homozygosity (ROH) of each sample to find any possible homozygous haplotypes shared between two or more samples. Then reports the largest haplotypes (and their sub-haplotypes if any) in a BED file.
